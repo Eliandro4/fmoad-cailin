@@ -15,6 +15,16 @@
  */
 
 #include "al.h"
+#include <string.h>
+
+SoundObject sounds[MAXSOUNDS];
+unsigned int sound_counter = 0;
+
+StreamPlayer StreamPlayerArr[MAXSOUNDS];
+unsigned int sp_counter = 0;
+
+static ALCdevice *alc_device = NULL;
+static ALCcontext *alc_ctx = NULL;
 
 int al_init(void)
 {
@@ -38,6 +48,8 @@ int al_init(void)
 		fprintf(stderr, "Could not set a context!\n");
 		return 1;
 	}
+	alc_device = device;
+	alc_ctx = ctx;
 	name = NULL;
 	if(alcIsExtensionPresent(device, "ALC_ENUMERATE_ALL_EXT"))
 		name = alcGetString(device, ALC_ALL_DEVICES_SPECIFIER);
@@ -53,21 +65,44 @@ StreamPlayer *NewPlayer(void)
 {
 	StreamPlayer *player;
 	player = malloc(sizeof(*player));
-	assert(player != NULL);
+	if (player == NULL)
+		return NULL;
 	player->status = STOPPED;
 	player->released = false;
 	player->retired = false;
+	player->looping = false;
+	player->volume = 1.0f;
+	player->fp = NULL;
+	player->ov_file = NULL;
+	player->membuf = NULL;
+	player->mem_data = NULL;
+	player->mem_len = 0;
+	player->mem_pos = 0;
 	alGenBuffers(NUM_BUFFERS, player->buffers);
-	assert(alGetError() == AL_NO_ERROR && "Could not create buffers");
+	if (alGetError() != AL_NO_ERROR) {
+		free(player);
+		fprintf(stderr, "Could not create buffers (OpenAL limit reached)\n");
+		return NULL;
+	}
 	alGenSources(1, &player->source);
-	assert(alGetError() == AL_NO_ERROR && "Could not create source");
+	if (alGetError() != AL_NO_ERROR) {
+		alDeleteBuffers(NUM_BUFFERS, player->buffers);
+		free(player);
+		fprintf(stderr, "Could not create source (OpenAL limit reached)\n");
+		return NULL;
+	}
 
 	/* Set parameters so mono sources play out the front-center speaker and
 	 * won't distance attenuate. */
 	alSource3i(player->source, AL_POSITION, 0, 0, -1);
 	alSourcei(player->source, AL_SOURCE_RELATIVE, AL_TRUE);
 	alSourcei(player->source, AL_ROLLOFF_FACTOR, 0);
-	assert(alGetError() == AL_NO_ERROR && "Could not set source parameters");
+	if (alGetError() != AL_NO_ERROR) {
+		alDeleteSources(1, &player->source);
+		alDeleteBuffers(NUM_BUFFERS, player->buffers);
+		free(player);
+		return NULL;
+	}
 
 	return player;
 }
@@ -78,7 +113,8 @@ SoundObject *NewSoundObject(void)
 	so = malloc(sizeof(*so));
 	assert(so != NULL);
 	so->n_filepaths = 0;
-	so->filepaths = NULL;
+	so->mem_data = NULL;
+	so->mem_len = NULL;
 	so->path = "\0";
 	return so;
 }
@@ -91,11 +127,8 @@ void DeletePlayer(StreamPlayer *player)
 	if(alGetError() != AL_NO_ERROR)
 		fprintf(stderr, "Failed to delete object IDs\n");
 	player->released = true;
-	fclose(player->fp);
-	if (player->ov_file)
-		free(player->ov_file);
-	if (player->membuf)
-		free(player->membuf);
+	player->retired = true;
+	ClosePlayerFile(player);
 }
 
 // from openal-soft's alstream.c example
@@ -180,6 +213,19 @@ int UpdatePlayer(StreamPlayer *player)
 				player->ov_info.rate);
 			alSourceQueueBuffers(player->source, 1, &bufid);
 		}
+		else if (player->looping)
+		{
+			/* End of sample reached: restart decoding from the
+			 * beginning (clean re-open, not ov_pcm_seek) so the track
+			 * repeats seamlessly without corrupted audio. */
+			if (ReopenVorbis(player) &&
+			    (ov_len = ov_read(player->ov_file, player->membuf, BUFFER_SAMPLES, 0, 2, 1, &current_section)) > 0)
+			{
+				alBufferData(bufid, player->format, player->membuf, (ALsizei)ov_len,
+					player->ov_info.rate);
+				alSourceQueueBuffers(player->source, 1, &bufid);
+			}
+		}
 		if(alGetError() != AL_NO_ERROR)
 		{
 			fprintf(stderr, "Error buffering data\n");
@@ -208,22 +254,75 @@ int UpdatePlayer(StreamPlayer *player)
 	return 1;
 }
 
-/* Opens the first audio stream of the named file. */
-int OpenPlayerFile(StreamPlayer *player, const char *filename)
+static size_t mem_ov_read(void *ptr, size_t size, size_t nmemb, void *datasource)
+{
+	StreamPlayer *p = (StreamPlayer *)datasource;
+	size_t avail = p->mem_len - p->mem_pos;
+	size_t need = size * nmemb;
+	if (need > avail)
+		need = avail;
+	memcpy(ptr, p->mem_data + p->mem_pos, need);
+	p->mem_pos += need;
+	return need / size;
+}
+
+static int mem_ov_seek(void *datasource, ogg_int64_t offset, int whence)
+{
+	StreamPlayer *p = (StreamPlayer *)datasource;
+	size_t new_pos;
+	switch (whence) {
+	case SEEK_SET:
+		new_pos = (size_t)offset;
+		break;
+	case SEEK_CUR:
+		new_pos = p->mem_pos + (size_t)offset;
+		break;
+	case SEEK_END:
+		new_pos = p->mem_len + (size_t)offset;
+		break;
+	default:
+		return -1;
+	}
+	if (new_pos > p->mem_len)
+		return -1;
+	p->mem_pos = new_pos;
+	return 0;
+}
+
+static int mem_ov_close(void *datasource)
+{
+	(void)datasource;
+	return 0;
+}
+
+static long mem_ov_tell(void *datasource)
+{
+	StreamPlayer *p = (StreamPlayer *)datasource;
+	return (long)p->mem_pos;
+}
+
+/* Opens the first audio stream from an in-memory OGG buffer. */
+int OpenPlayerFile(StreamPlayer *player, const uint8_t *data, size_t len)
 {
 	size_t frame_size;
+	player->mem_data = (uint8_t *)data;
+	player->mem_len = len;
+	player->mem_pos = 0;
+
 	player->ov_file = (OggVorbis_File *)malloc(sizeof(OggVorbis_File));
 
-	/* Open the audio file and check that it's usable. */
-	player->fp = fopen(filename, "r");
-	if (!player->fp)
+	static ov_callbacks mem_cbs;
+	memset(&mem_cbs, 0, sizeof(mem_cbs));
+	mem_cbs.read_func = mem_ov_read;
+	mem_cbs.seek_func = mem_ov_seek;
+	mem_cbs.close_func = mem_ov_close;
+	mem_cbs.tell_func = mem_ov_tell;
+
+	if(ov_open_callbacks(player, player->ov_file, NULL, 0, mem_cbs) < 0)
 	{
-		fprintf(stderr, "Failed to open %s\n", filename);
-		exit(1);
-	}
-	if(ov_open_callbacks(player->fp, player->ov_file, NULL, 0, OV_CALLBACKS_DEFAULT) < 0)
-	{
-		fprintf(stderr, "Could not open audio in %s\n", filename);
+		fprintf(stderr, "Could not open audio in memory\n");
+		free(player->ov_file);
+		player->ov_file = NULL;
 		return 0;
 	}
 
@@ -237,7 +336,7 @@ int OpenPlayerFile(StreamPlayer *player, const char *filename)
 	if(!player->format)
 	{
 		fprintf(stderr, "Unsupported channel count: %d\n", player->ov_info.channels);
-		fclose(player->fp);
+		free(player->ov_file);
 		player->ov_file = NULL;
 		return 0;
 	}
@@ -248,16 +347,59 @@ int OpenPlayerFile(StreamPlayer *player, const char *filename)
 	return 1;
 }
 
-/* Closes the audio file stream */
+/* Restart decoding of the same in-memory OGG from the very beginning.
+ * Re-opening is preferred over ov_pcm_seek() here because the latter
+ * desynchronises the decoder from our custom read/seek callbacks and
+ * yields corrupted ("garbage") audio at the loop point. */
+int ReopenVorbis(StreamPlayer *player)
+{
+	static ov_callbacks mem_cbs;
+	memset(&mem_cbs, 0, sizeof(mem_cbs));
+	mem_cbs.read_func = mem_ov_read;
+	mem_cbs.seek_func = mem_ov_seek;
+	mem_cbs.close_func = mem_ov_close;
+	mem_cbs.tell_func = mem_ov_tell;
+
+	if (player->ov_file)
+		ov_clear(player->ov_file);
+
+	player->mem_pos = 0;
+	if (ov_open_callbacks(player, player->ov_file, NULL, 0, mem_cbs) < 0) {
+		fprintf(stderr, "Could not reopen looping audio in memory\n");
+		return 0;
+	}
+	player->ov_info = *ov_info(player->ov_file, -1);
+	return 1;
+}
+
+/* Closes the audio stream */
 void ClosePlayerFile(StreamPlayer *player)
 {
-	if(player->fp)
-		fclose(player->fp);
-	if(player->ov_file)
+	if(player->ov_file) {
+		ov_clear(player->ov_file);
+		free(player->ov_file);
 		player->ov_file = NULL;
+	}
 	if(player->membuf)
 	{
 		free(player->membuf);
 		player->membuf = NULL;
+	}
+	player->mem_data = NULL;
+	player->mem_len = 0;
+	player->mem_pos = 0;
+}
+
+/* Tears down the OpenAL context and device opened by al_init(). */
+void al_shutdown(void)
+{
+	if (alc_ctx != NULL) {
+		alcMakeContextCurrent(NULL);
+		alcDestroyContext(alc_ctx);
+		alc_ctx = NULL;
+	}
+	if (alc_device != NULL) {
+		alcCloseDevice(alc_device);
+		alc_device = NULL;
 	}
 }

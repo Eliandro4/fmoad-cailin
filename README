@@ -10,10 +10,6 @@ Similar project: https://github.com/moon-chilled/openfmod
 What You Need
 -------------
 
-* [fsb-extract-dumb](https://github.com/moon-chilled/fsb-extract-dumb)
-* [python-fsb5](https://github.com/HearthSim/python-fsb5) with extract.py (fsb5-extract module on OpenBSD)
-* [manifest files](https://files.catbox.moe/yej6xx.tgz)
-* json-c
 * openal
 * vorbisfile
 
@@ -22,19 +18,24 @@ How To Use
 
 Same preparation as with [openfmod](https://github.com/moon-chilled/openfmod):
 
-- Grab fsb-extract-dumb (https://github.com/moon-chilled/fsb-extract-dumb)
-- run fsb-extract-dumb file.bank
-  generates a file like file.fsb
-- Grab python-fsb5 (https://github.com/HearthSim/python-fsb5)
-  python3 extract.py file.fsb -o file.banko
-  * (Don't use pypy, it's slower.)
-- so:
-  for i in *.bank; do fsb-extract-dumb "$i"; fsb5-extract "${i/bank/fsb}" -o "${i}o"; done
+- Drop file `libfmodstudio.so` in the game's directory. Make sure the dllmap file(s) for the game point for all {,lib}fmod{,studio} to this file.
 
-- You also need manifest files for all the bank files.
-- For celeste, use (https://files.catbox.moe/y1p0gd.tgz)
-  - (Actually, use https://files.catbox.moe/yej6xx.tgz)
-  - Extract, and move all json files into the same directory as the .bank files.
+Native Bank Loading
+-------------------
+
+fmoad-cailin can now load FMOD banks natively without external tools.
+
+When `FMOD_Studio_System_LoadBankFile` is called:
+
+1. It first looks for a JSON manifest (`bankname.json`) alongside the `.bank` file.
+   If found, it uses the manifest for event metadata (existing behavior).
+
+2. If no JSON manifest is found, it parses the `.bank` file directly:
+   - Locates the embedded FSB5 audio data
+   - Extracts all samples as OGG files into `bankname.banko/`
+   - Creates synthetic event entries for each sample
+
+This eliminates the need for `fsb-extract-dumb` and `python-fsb5`.
 
 How to Build
 ------------
@@ -44,7 +45,7 @@ $ make
 ```
 
 And Then?
----------
+----------
 
 Drop file `libfmodstudio.so` in the game's directory. Make sure the dllmap file(s) for the game point for all {,lib}fmod{,studio} to this file.
 

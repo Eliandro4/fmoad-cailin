@@ -29,7 +29,7 @@
 #define MAXSOUNDS	65536
 #define NUM_BUFFERS	16
 #define BUFFER_SAMPLES	65536
-#define NUM_SOURCES	16
+#define NUM_SOURCES	256
 
 typedef enum {
 	PLAYING,
@@ -48,24 +48,31 @@ typedef struct StreamPlayer {
 	char *membuf;
 	const char *fm_path;	// FMOD internal path
 
+	uint8_t *mem_data;
+	size_t mem_len;
+	size_t mem_pos;
+
 	ALenum format;
 
 	PLAYER_STATUS status;
 	bool released;		// FMOD wants source to be free'd when stopped next
 	bool retired;		// this is an inactive StreamPlayer for reuse
+	bool looping;		// repeat from start when the sample ends (music/ambience)
+	float volume;		// per-event volume, folded into AL_GAIN by apply_audio_state
 } StreamPlayer;
 
 typedef struct SoundObject{
 	unsigned int n_filepaths;	// number of filepaths in array
-	char **filepaths;		// array of filepaths
+	uint8_t **mem_data;		// array of OGG byte buffers (in-memory)
+	size_t *mem_len;		// array of OGG byte lengths
 	const char *path;		// FMOD internal path
 } SoundObject;
 
-static SoundObject sounds[MAXSOUNDS];
-static unsigned int sound_counter = 0;
+extern SoundObject sounds[MAXSOUNDS];
+extern unsigned int sound_counter;
 
-static StreamPlayer StreamPlayerArr[MAXSOUNDS];
-static unsigned int sp_counter = 0;
+extern StreamPlayer StreamPlayerArr[MAXSOUNDS];
+extern unsigned int sp_counter;
 
 int al_init(void);
 
@@ -73,11 +80,16 @@ SoundObject *NewSoundObject(void);
 StreamPlayer *NewPlayer(void);
 
 void DeletePlayer(StreamPlayer *player);
-void ClosePlayer(StreamPlayer *player);
+void ClosePlayerFile(StreamPlayer *player);
 int StartPlayer(StreamPlayer *player);
 int StopPlayer(StreamPlayer *player);
 int UpdatePlayer(StreamPlayer *player);
-int OpenPlayerFile(StreamPlayer *player, const char *filename);
+int OpenPlayerFile(StreamPlayer *player, const uint8_t *data, size_t len);
 void ClosePlayerFile(StreamPlayer *player);
+/* Re-initialise the vorbis decoder from the same in-memory OGG so a
+ * looping track restarts cleanly from the beginning (avoids the decode
+ * desync/garbage that ov_pcm_seek produces with custom I/O callbacks). */
+int ReopenVorbis(StreamPlayer *player);
+void al_shutdown(void);
 
 #endif // AL_H
