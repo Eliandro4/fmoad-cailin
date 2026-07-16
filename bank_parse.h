@@ -42,6 +42,11 @@ struct fev_event {
 };
 
 /* Result of parsing a bank's static structure. */
+struct fev_string_entry {
+	struct fev_guid guid;
+	char *path;
+};
+
 struct fev_bank {
 	const uint8_t *data;        /* bank bytes (borrowed) */
 	size_t size;
@@ -49,15 +54,19 @@ struct fev_bank {
 	bool has_guid;
 	uint32_t n_events;
 	struct fev_event *events;   /* caller frees (and each ->waves) */
+	uint32_t n_strings;
+	struct fev_string_entry *strings; /* caller frees strings array and each ->path */
 };
 
-/* Parse the FEV container and enumerate its events.
- * Returns 0 on success (even if the bank has zero events), <0 on a fatal
- * parse error (not a RIFF/FEV file, truncated, ...).  On success the caller
- * owns ->events and each ->waves and must release them with fev_bank_free(). */
 int fev_parse(const uint8_t *data, size_t size, struct fev_bank *out);
 
-/* Release storage allocated by fev_parse(). */
+/* Parse the STDT (String Data Table) from a .strings.bank file.
+ * Populates out->strings[] with GUID-to-path mappings extracted from the
+ * packed radix trie.  Returns 0 on success, <0 on error.  If no STDT chunk
+ * is found, out->n_strings remains 0 and this is not an error. */
+int fev_parse_strings(const uint8_t *data, size_t size, struct fev_bank *out);
+
+/* Release storage allocated by fev_parse() / fev_parse_strings(). */
 void fev_bank_free(struct fev_bank *bank);
 
 /* Render a GUID as the canonical "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
