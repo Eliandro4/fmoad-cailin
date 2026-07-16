@@ -32,6 +32,30 @@ int get_sound_idx(char *path)
 	return -1;	// not found, this is an error
 }
 
+/* Read an entire file into a freshly allocated buffer (caller frees). */
+static uint8_t *read_file_bytes(const char *filename, size_t *out_len)
+{
+	FILE *fp = fopen(filename, "rb");
+	if (!fp)
+		return NULL;
+	fseek(fp, 0, SEEK_END);
+	long sz = ftell(fp);
+	fseek(fp, 0, SEEK_SET);
+	uint8_t *buf = malloc((size_t)sz);
+	if (!buf) {
+		fclose(fp);
+		return NULL;
+	}
+	if (fread(buf, 1, (size_t)sz, fp) != (size_t)sz) {
+		fclose(fp);
+		free(buf);
+		return NULL;
+	}
+	fclose(fp);
+	*out_len = (size_t)sz;
+	return buf;
+}
+
 /* Bus/VCA registries, keyed by their FMOD path (e.g. "bus:/music").
  * Celeste re-queries the same path every frame (volume sliders, pause
  * flags) and expects the state to persist, so we cache the nodes here
@@ -320,17 +344,40 @@ int bank_load_native(BANK *bank, const char *filename)
 	}
 	free(bank_data);
 
-	/* Check for non-FSB5 banks (e.g. strings banks in FEV/RIFF format). */
+	/* Check for non-FSB5 banks (e.g. .strings.bank in FEV/RIFF format). */
 	{
 		FILE *fp2 = fopen(filename, "rb");
 		if (fp2) {
 			char magic[4];
-			if (fread(magic, 1, 4, fp2) == 4 && memcmp(magic, "RIFF", 4) == 0) {
-				fclose(fp2);
-				bank->native_loaded = false;
-				return 0;
-			}
+		if (fread(magic, 1, 4, fp2) == 4 && memcmp(magic, "RIFF", 4) == 0) {
 			fclose(fp2);
+
+			/* Native STDT parsing: a .strings.bank carries the
+			 * Event GUID -> path table.  Parse it and merge those
+			 * mappings into the process-global registry so FMOD
+			 * Studio GUID<->path queries (GetEventByID, LookupID,
+			 * LookupPath, Bank_GetStringInfo) can be answered
+			 * natively, without the events_db.  See docs/bank_parsing.md.
+			 * The parsed strings live on the BANK for its lifetime. */
+			uint8_t *sb = read_file_bytes(filename, &bank_size);
+			if (sb) {
+				memset(&bank->fev, 0, sizeof(bank->fev));
+				if (fev_parse_strings(sb, bank_size, &bank->fev) == 0 &&
+				    bank->fev.n_strings > 0) {
+					fev_strmap_add_bank(&bank->fev);
+					DPRINT(1, "strings bank parsed: %s (%u strings)",
+					       basename(shortname),
+					       bank->fev.n_strings);
+				} else {
+					DPRINT(1, "non-FSB5 bank (no STDT): %s",
+					       basename(shortname));
+				}
+				free(sb);
+			}
+			bank->native_loaded = false;
+			return 0;
+		}
+		fclose(fp2);
 		}
 	}
 
@@ -365,9 +412,12 @@ void bank_free_native(BANK *bank)
 		free(bank->sample_names);
 		free(bank->sample_ogg_data);
 		free(bank->sample_ogg_len);
-		fev_bank_free(&bank->fev);
 		events_db_free(&bank->events);
 	}
+	/* The fev struct is parsed for every bank flavour (sound banks via
+	 * fev_parse, strings banks via fev_parse_strings) and owns the
+	 * per-bank STDT strings, so always release it. */
+	fev_bank_free(&bank->fev);
 }
 
 VCA *NewVca(void)
@@ -538,7 +588,28 @@ int FMOD_Studio_System_LoadBankMemory(SYSTEM *system,
 		err(1, NULL);
 	memset(newbank, 0, sizeof(*newbank));
 
-	if (bank_extract_fsb5(newbank, (const uint8_t *)buffer, (size_t)length) < 0) {
+	const uint8_t *buf = (const uint8_t *)buffer;
+	size_t buflen = (size_t)length;
+
+	/* A .strings.bank (RIFF/STDT, no FSB5) is also loaded via this entry
+	 * point.  Detect and parse its string table first so the GUID<->path
+	 * registry is populated the same way as LoadBankFile.  See
+	 * docs/bank_parsing.md. */
+	memset(&newbank->fev, 0, sizeof(newbank->fev));
+	if (buflen >= 4 && memcmp(buf, "RIFF", 4) == 0 &&
+	    fev_parse_strings(buf, buflen, &newbank->fev) == 0 &&
+	    newbank->fev.n_strings > 0) {
+		fev_strmap_add_bank(&newbank->fev);
+		newbank->native_loaded = false;
+		newbank->bankpath = NULL;
+		newbank->name = NULL;
+		newbank->parentdir = NULL;
+		*bank = newbank;
+		return 0;
+	}
+
+	if (bank_extract_fsb5(newbank, buf, buflen) < 0) {
+		fev_bank_free(&newbank->fev);
 		free(newbank);
 		return -1;
 	}
@@ -1146,7 +1217,18 @@ int FMOD_Studio_System_GetBusByID(SYSTEM * studiosystem, void * guid, void * bus
 
 int FMOD_Studio_System_GetEventByID(SYSTEM * studiosystem, void * guid, void * description)
 {
-	STUB();
+	struct fev_guid g;
+	memcpy(g.data, guid, 16);
+	const char *path = fev_strmap_lookup_path(&g);
+	if (!path) {
+		DPRINT(1, "GetEventByID: unknown GUID");
+		*(EVENTDESCRIPTION **)description = NULL;
+		return 0;
+	}
+	/* Delegate to the path-based lookup so the description is built the
+	 * same way (and resolves its sound_idx from the same registry). */
+	return FMOD_Studio_System_GetEvent(studiosystem, path,
+	                                   (EVENTDESCRIPTION **)description);
 }
 
 int FMOD_Studio_System_GetVCAByID(SYSTEM * studiosystem, void * guid, void * vca)
@@ -1156,12 +1238,34 @@ int FMOD_Studio_System_GetVCAByID(SYSTEM * studiosystem, void * guid, void * vca
 
 int FMOD_Studio_System_LookupID(SYSTEM * studiosystem, char * path, void * guid)
 {
-	STUB();
+	/* Native path -> GUID resolution from the global STDT registry
+	 * (built from .strings.bank files).  The registry is keyed by the
+	 * canonical GUID string, so we must find the entry whose path
+	 * matches and copy back its raw 16-byte GUID.  See docs/bank_parsing.md. */
+	struct fev_strmap *sm = fev_strmap_get();
+	for (uint32_t i = 0; i < sm->count; i++) {
+		if (sm->entries[i].path && strcmp(sm->entries[i].path, path) == 0) {
+			memcpy(guid, sm->entries[i].guid.data, 16);
+			return 0;
+		}
+	}
+	DPRINT(1, "LookupID: unknown path %s", path);
+	return 0;
 }
 
 int FMOD_Studio_System_LookupPath(SYSTEM * studiosystem, void * guid, void * path, int size, int * retrieved)
 {
-	STUB();
+	struct fev_guid g;
+	memcpy(g.data, guid, 16);
+	const char *p = fev_strmap_lookup_path(&g);
+	if (!p) {
+		DPRINT(1, "LookupPath: unknown GUID");
+		return 0;
+	}
+	strlcpy((char *)path, p, size);
+	if (retrieved)
+		*retrieved = strnlen(p, size - 1) + 1;
+	return 0;
 }
 
 int FMOD_Studio_System_GetSoundInfo(SYSTEM * studiosystem, char * key, void * info)
@@ -1311,12 +1415,26 @@ int FMOD_Studio_Bank_GetSampleLoadingState(BANK * bank, void * state)
 
 int FMOD_Studio_Bank_GetStringCount(BANK * bank, int * count)
 {
-	STUB();
+	if (!bank || !count)
+		return 0;
+	*count = (int)bank->fev.n_strings;
+	return 0;
 }
 
 int FMOD_Studio_Bank_GetStringInfo(BANK * bank, int index, void * id, void * path, int size, int * retrieved)
 {
-	STUB();
+	if (!bank || index < 0 || (uint32_t)index >= bank->fev.n_strings)
+		return 0;
+	if (id)
+		memcpy(id, bank->fev.strings[index].guid.data, 16);
+	if (path && size > 0) {
+		const char *p = bank->fev.strings[index].path ?
+			bank->fev.strings[index].path : "";
+		strlcpy((char *)path, p, size);
+		if (retrieved)
+			*retrieved = strnlen(p, size - 1) + 1;
+	}
+	return 0;
 }
 
 int FMOD_Studio_Bank_GetUserData(BANK * studiosystem, void * userdata)
@@ -1371,7 +1489,21 @@ int FMOD_Studio_Bus_IsValid(BUS * bus)
 
 int FMOD_Studio_EventDescription_GetID(EVENTDESCRIPTION * eventdescription, void * id)
 {
-	STUB();
+	/* Resolve the event's GUID natively from the global STDT registry.
+	 * The event description only stores its path, so we look that path
+	 * up and copy back the 16-byte GUID. */
+	if (!eventdescription || !id)
+		return 0;
+	struct fev_strmap *sm = fev_strmap_get();
+	for (uint32_t i = 0; i < sm->count; i++) {
+		if (sm->entries[i].path &&
+		    strcmp(sm->entries[i].path, eventdescription->path) == 0) {
+			memcpy(id, sm->entries[i].guid.data, 16);
+			return 0;
+		}
+	}
+	DPRINT(1, "GetID: unknown path %s", eventdescription->path);
+	return 0;
 }
 
 int FMOD_Studio_EventDescription_GetInstanceCount(EVENTDESCRIPTION * eventdescription, int * count)

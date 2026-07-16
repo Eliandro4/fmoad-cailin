@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 /*
  * Native FMOD FEV bank parser.  See bank_parse.h for the format notes and the
  * public API.  The parser walks the RIFF/LIST container hierarchy and pulls the
@@ -442,4 +443,104 @@ char *fev_guid_str(const struct fev_guid *g, char *buf, size_t bufsz)
 	         d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
 	         d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
 	return buf;
+}
+
+int fev_guid_eq(const struct fev_guid *a, const struct fev_guid *b)
+{
+	if (!a || !b)
+		return 0;
+	return memcmp(a->data, b->data, sizeof(a->data)) == 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Global GUID -> path registry (fed by parsed .strings.bank files).  */
+/* ------------------------------------------------------------------ */
+
+#define STRMAP_INIT_CAP	256
+
+static struct fev_strmap g_strmap = { NULL, 0, 0 };
+
+struct fev_strmap *fev_strmap_get(void)
+{
+	return &g_strmap;
+}
+
+int fev_strmap_add_bank(struct fev_bank *bank)
+{
+	if (!bank || bank->n_strings == 0)
+		return 0;
+
+	if (g_strmap.cap == 0) {
+		g_strmap.entries = calloc(STRMAP_INIT_CAP,
+		                          sizeof(*g_strmap.entries));
+		if (!g_strmap.entries)
+			return -1;
+		g_strmap.cap = STRMAP_INIT_CAP;
+	}
+
+	for (uint32_t i = 0; i < bank->n_strings; i++) {
+		if (!bank->strings[i].path)
+			continue;
+
+		/* Skip duplicates (first bank to define a GUID wins). */
+		bool dup = false;
+		for (uint32_t j = 0; j < g_strmap.count; j++) {
+			if (fev_guid_eq(&g_strmap.entries[j].guid,
+			                &bank->strings[i].guid)) {
+				dup = true;
+				break;
+			}
+		}
+		if (dup)
+			continue;
+
+		if (g_strmap.count == g_strmap.cap) {
+			uint32_t ncap = g_strmap.cap * 2;
+			struct fev_strmap_entry *ne = realloc(g_strmap.entries,
+				ncap * sizeof(*ne));
+			if (!ne)
+				return -1;
+			g_strmap.entries = ne;
+			g_strmap.cap = ncap;
+		}
+		g_strmap.entries[g_strmap.count].guid = bank->strings[i].guid;
+		g_strmap.entries[g_strmap.count].path = bank->strings[i].path;
+		g_strmap.count++;
+	}
+	return 0;
+}
+
+const char *fev_strmap_lookup_path(const struct fev_guid *guid)
+{
+	if (!guid)
+		return NULL;
+	for (uint32_t i = 0; i < g_strmap.count; i++)
+		if (fev_guid_eq(&g_strmap.entries[i].guid, guid))
+			return g_strmap.entries[i].path;
+	return NULL;
+}
+
+int fev_strmap_lookup_guid(const char *guid_str, struct fev_guid *out)
+{
+	if (!guid_str || !out)
+		return 0;
+	struct fev_guid g;
+	memset(&g, 0, sizeof(g));
+	/* Accept the canonical "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" form. */
+	int n = 0;
+	for (int i = 0; i < 16; i++) {
+		/* Skip the three separator dashes. */
+		if (i == 4 || i == 6 || i == 8 || i == 10) {
+			if (guid_str[n] != '-')
+				return 0;
+			n++;
+		}
+		unsigned hi;
+		if (sscanf(guid_str + n, "%2x", &hi) != 1)
+			return 0;
+		g.data[i] = (uint8_t)hi;
+		n += 2;
+	}
+	*out = g;
+	return 1;
 }
