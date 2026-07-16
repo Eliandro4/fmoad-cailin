@@ -20,6 +20,8 @@
 #define FEV_EVNT	0x544e5645u	/* "EVNT" (LIST type wrapping an event) */
 #define FEV_EVBT	0x42545645u	/* "EVBT" (event body chunk) */
 #define FEV_STDT	0x54445453u	/* "STDT" (string data table) */
+#define FEV_TLNS	0x534e4c54u	/* "TLNS" (wave GUID -> event GUID mappings) */
+#define FEV_TLNB	0x424e4c54u	/* "TLNB" (TLNS entry payload) */
 
 static uint32_t rd_u32(const uint8_t *p)
 {
@@ -542,5 +544,385 @@ int fev_strmap_lookup_guid(const char *guid_str, struct fev_guid *out)
 		n += 2;
 	}
 	*out = g;
+	return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* TLNS (wave GUID -> event GUID mapping) parser                     */
+/* ------------------------------------------------------------------ */
+
+int fev_parse_tlns(const uint8_t *data, size_t size, struct fev_tlns *out)
+{
+	if (!data || !out || size < 12)
+		return -1;
+
+	memset(out, 0, sizeof(*out));
+
+	/* Find the TLNS LIST chunk.  In this FEV flavour the TLNS section is a
+	 * tagged marker followed by LCNT and child LIST entries, each wrapping
+	 * a TLNB payload that holds one wave GUID and one event GUID. */
+	const uint8_t *tlns_marker = NULL;
+	for (size_t i = 12; i + 4 <= size; i++) {
+		if (rd_u32(data + i) == FEV_TLNS) {
+			tlns_marker = data + i;
+			break;
+		}
+	}
+	if (!tlns_marker)
+		return 0;
+
+	/* Bound the scan at EOF. */
+	const uint8_t *end = data + size;
+
+	/* Parse child LIST entries under TLNS.  Each child is:
+	 *   LIST TMLN
+	 *     TLNB magic(4) + unknown(4) + wave_guid(16) + event_guid(16) + ... */
+	const uint8_t *p = tlns_marker + 4; /* skip TLNS tag */
+	while (p + 8 <= end) {
+		uint32_t tag = rd_u32(p);
+		uint32_t sz = rd_u32(p + 4);
+		const uint8_t *cend = p + 8 + (size_t)sz;
+		if (cend > end)
+			break;
+
+		if (tag == FEV_LIST && cend - p >= 12) {
+			const uint8_t *payload = p + 12;
+
+			/* Look for TLNB inside the LIST payload. */
+			const uint8_t *tlnb = payload;
+			while (tlnb + 8 <= cend) {
+				if (rd_u32(tlnb) == FEV_TLNB) {
+					uint32_t tlnb_size = rd_u32(tlnb + 4);
+					const uint8_t *tlnb_payload = tlnb + 8;
+					const uint8_t *tlnb_end = tlnb + 8 + (size_t)tlnb_size;
+					if (tlnb_end > cend)
+						break;
+
+					/* Need at least: wave(16) + event(16) */
+					if (tlnb_end - tlnb_payload >= 32) {
+						if (out->count == out->cap) {
+							uint32_t ncap = out->cap ? out->cap * 2 : 16;
+							struct fev_tlns_entry *ne = realloc(out->entries,
+							                                     ncap * sizeof(*ne));
+							if (!ne) {
+								free(out->entries);
+								out->entries = NULL;
+								return -1;
+							}
+							out->entries = ne;
+							out->cap = ncap;
+						}
+						struct fev_tlns_entry *e = &out->entries[out->count];
+						memcpy(e->wave_guid.data, tlnb_payload, 16);
+						memcpy(e->event_guid.data, tlnb_payload + 16, 16);
+						out->count++;
+					}
+					break;
+				}
+				tlnb += 8;
+			}
+		}
+
+		size_t step = (size_t)sz + 8;
+		if (step < 8 || p + step > end)
+			break;
+		p += step;
+	}
+
+	return 0;
+}
+
+void fev_tlns_free(struct fev_tlns *tlns)
+{
+	if (!tlns)
+		return;
+	free(tlns->entries);
+	tlns->entries = NULL;
+	tlns->count = 0;
+	tlns->cap = 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Heuristic: event path -> candidate sample name(s)                  */
+/* ------------------------------------------------------------------ */
+
+char *fev_event_path_to_sample_name(const char *event_path)
+{
+	if (!event_path)
+		return NULL;
+
+	/* Remove 'event:/' prefix */
+	const char *p = event_path;
+	if (strncmp(p, "event:/", 7) == 0)
+		p += 7;
+
+	/* Split by '/' and clean each part */
+	char buf[4096];
+	int blen = 0;
+	buf[0] = '\0';
+
+	const char *part = p;
+	while (*part) {
+		const char *slash = strchr(part, '/');
+		size_t plen = slash ? (size_t)(slash - part) : strlen(part);
+
+		/* Copy part */
+		char segment[256];
+		if (plen >= sizeof(segment))
+			plen = sizeof(segment) - 1;
+		memcpy(segment, part, plen);
+		segment[plen] = '\0';
+
+		/* Remove common subfolder suffixes */
+		char *cleaned = segment;
+		const char *suffixes[] = {
+			"_map", "_cliffside", "_temple", "_reflection",
+			"_forsaken_city", "_summit", "_ridge", "_heaven", NULL
+		};
+		for (int i = 0; suffixes[i]; i++) {
+			size_t slen = strlen(suffixes[i]);
+			if (plen > slen && memcmp(cleaned + plen - slen, suffixes[i], slen) == 0) {
+				cleaned[plen - slen] = '\0';
+				break;
+			}
+		}
+
+		/* Append to buffer */
+		if (blen > 0)
+			buf[blen++] = '_';
+		size_t clen = strlen(cleaned);
+		if (blen + clen < sizeof(buf) - 1) {
+			memcpy(buf + blen, cleaned, clen);
+			blen += clen;
+		}
+		buf[blen] = '\0';
+
+		if (!slash)
+			break;
+		part = slash + 1;
+	}
+
+	/* Pad numbers followed by 'ms' to 4 digits */
+	char out[4096];
+	char *dst = out;
+	const char *src = buf;
+	while (*src) {
+		if (*src >= '0' && *src <= '9') {
+			const char *num_start = src;
+			while (*src >= '0' && *src <= '9')
+				src++;
+			size_t num_len = (size_t)(src - num_start);
+			if (strncmp(src, "ms", 2) == 0 && num_len < 4) {
+				for (size_t i = 0; i < 4 - num_len; i++)
+					*dst++ = '0';
+			}
+			memcpy(dst, num_start, num_len);
+			dst += num_len;
+		} else {
+			*dst++ = *src++;
+		}
+	}
+	*dst = '\0';
+
+	return strdup(out);
+}
+
+/* Match a candidate sample name against the FSB5 sample names.
+ * Returns a newly allocated array of matching sample names (caller frees). */
+char **fev_match_sample_names(const char *candidate, const char **sample_names,
+                          uint32_t sample_count, uint32_t *out_count)
+{
+	if (!candidate || !sample_names || sample_count == 0) {
+		*out_count = 0;
+		return NULL;
+	}
+
+	uint32_t cap = 4;
+	char **matches = calloc(cap, sizeof(char *));
+	if (!matches) {
+		*out_count = 0;
+		return NULL;
+	}
+
+	size_t clen = strlen(candidate);
+	for (uint32_t i = 0; i < sample_count; i++) {
+		const char *name = sample_names[i];
+		size_t nlen = strlen(name);
+
+		/* Exact match */
+		if (strcmp(name, candidate) == 0) {
+			if (*out_count == cap) {
+				cap *= 2;
+				char **nm = realloc(matches, cap * sizeof(char *));
+				if (!nm) {
+					for (uint32_t j = 0; j < *out_count; j++)
+						free(matches[j]);
+					free(matches);
+					*out_count = 0;
+					return NULL;
+				}
+				matches = nm;
+			}
+			matches[*out_count] = strdup(name);
+			(*out_count)++;
+			continue;
+		}
+
+		/* Prefix match: candidate + '_' + digits */
+		if (nlen > clen && memcmp(name, candidate, clen) == 0 &&
+		    name[clen] == '_') {
+			const char *suffix = name + clen + 1;
+			int all_digits = 1;
+			for (const char *c = suffix; *c; c++) {
+				if (*c < '0' || *c > '9') {
+					all_digits = 0;
+					break;
+				}
+			}
+			if (all_digits) {
+				if (*out_count == cap) {
+					cap *= 2;
+					char **nm = realloc(matches, cap * sizeof(char *));
+					if (!nm) {
+						for (uint32_t j = 0; j < *out_count; j++)
+							free(matches[j]);
+						free(matches);
+						*out_count = 0;
+						return NULL;
+					}
+					matches = nm;
+				}
+				matches[*out_count] = strdup(name);
+				(*out_count)++;
+			}
+		}
+	}
+
+	if (*out_count == 0) {
+		free(matches);
+		matches = NULL;
+	}
+
+	return matches;
+}
+
+/* ------------------------------------------------------------------ */
+/* Native event->sample mapping builder (replaces events_db.bin).     */
+/* ------------------------------------------------------------------ */
+
+#include "events_db.h"
+
+int bank_build_events(const char *bankname, const uint8_t *bank_data,
+                      size_t bank_size, const char **sample_names,
+                      uint32_t sample_count, struct bank_events *out)
+{
+	if (!bankname || !bank_data || !sample_names || !out)
+		return 0;
+
+	memset(out, 0, sizeof(*out));
+	out->bankname = bankname;
+
+	/* Parse TLNS to get wave_guid -> event_guid mappings. */
+	struct fev_tlns tlns;
+	if (fev_parse_tlns(bank_data, bank_size, &tlns) < 0)
+		return 0;
+
+	if (tlns.count == 0) {
+		fev_tlns_free(&tlns);
+		return 0;
+	}
+
+	/* Collect unique event GUIDs from TLNS. */
+	uint32_t cap = tlns.count;
+	struct fev_guid *event_guids = calloc(cap, sizeof(*event_guids));
+	if (!event_guids) {
+		fev_tlns_free(&tlns);
+		return 0;
+	}
+	uint32_t nevents = 0;
+	for (uint32_t i = 0; i < tlns.count; i++) {
+		const struct fev_guid *eg = &tlns.entries[i].event_guid;
+		bool found = false;
+		for (uint32_t j = 0; j < nevents; j++) {
+			if (fev_guid_eq(eg, &event_guids[j])) {
+				found = true;
+				break;
+			}
+		}
+		if (!found && nevents < cap) {
+			event_guids[nevents++] = *eg;
+		}
+	}
+	fev_tlns_free(&tlns);
+
+	if (nevents == 0) {
+		free(event_guids);
+		return 0;
+	}
+
+	/* Look up event paths from the global string map. */
+	struct fev_strmap *strmap = fev_strmap_get();
+	if (!strmap || strmap->count == 0) {
+		free(event_guids);
+		return 0;
+	}
+
+	/* Count total matches to allocate the entry array. */
+	uint32_t total_entries = 0;
+	for (uint32_t i = 0; i < nevents; i++) {
+		const char *path = fev_strmap_lookup_path(&event_guids[i]);
+		if (!path)
+			continue;
+
+		char *candidate = fev_event_path_to_sample_name(path);
+		if (!candidate)
+			continue;
+
+		uint32_t matches = 0;
+		char **sample_matches = fev_match_sample_names(candidate, sample_names,
+		                                              sample_count, &matches);
+		free(candidate);
+		total_entries += matches;
+		free(sample_matches);
+	}
+
+	if (total_entries == 0) {
+		free(event_guids);
+		return 0;
+	}
+
+	/* Allocate and populate the entry array. */
+	struct event_entry *entries = calloc(total_entries, sizeof(*entries));
+	if (!entries) {
+		free(event_guids);
+		return 0;
+	}
+
+	uint32_t idx = 0;
+	for (uint32_t i = 0; i < nevents; i++) {
+		const char *path = fev_strmap_lookup_path(&event_guids[i]);
+		if (!path)
+			continue;
+
+		char *candidate = fev_event_path_to_sample_name(path);
+		if (!candidate)
+			continue;
+
+		uint32_t matches = 0;
+		char **sample_matches = fev_match_sample_names(candidate, sample_names,
+		                                              sample_count, &matches);
+		free(candidate);
+
+		for (uint32_t j = 0; j < matches && idx < total_entries; j++) {
+			entries[idx].path = strdup(path);
+			entries[idx].file = sample_matches[j];
+			idx++;
+		}
+		free(sample_matches);
+	}
+
+	free(event_guids);
+	out->count = idx;
+	out->entries = entries;
 	return 1;
 }

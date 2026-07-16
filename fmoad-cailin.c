@@ -322,27 +322,28 @@ int bank_load_native(BANK *bank, const char *filename)
 			       basename(shortname));
 		}
 
-		free(bank_data);
-
 		dot = strrchr(shortname, '.');
 		if (dot)
 			*dot = '\0';
 		bank->path = strdup(basename(shortname));
 
-		/* Resolve the bank's event->sample mapping from the embedded
-		 * database so events can be looked up.  (The bank files do not
-		 * carry the event->sample-name linkage; see bank_parse.h.) */
-		memset(&bank->events, 0, sizeof(bank->events));
-		if (events_db_find(basename(shortname), &bank->events)) {
-			DPRINT(1, "native bank loaded: %s (%u events)",
-			       filename, bank->events.count);
-		} else {
-			DPRINT(1, "native bank loaded: %s (no embedded events)",
-			       filename);
-		}
-		return 0;
+	/* Resolve the bank's event->sample mapping natively from the bank
+	 * file itself (TLNS + embedded strings + FSB5 sample names), instead
+	 * of relying on the events_db.bin blob. */
+	memset(&bank->events, 0, sizeof(bank->events));
+	if (bank_build_events(basename(shortname), bank_data, bank_size,
+	                      (const char **)bank->sample_names,
+	                      bank->sample_count, &bank->events)) {
+		DPRINT(1, "native bank loaded: %s (%u events)",
+		       filename, bank->events.count);
+	} else {
+		DPRINT(1, "native bank loaded: %s (no embedded events)",
+		       filename);
 	}
+
 	free(bank_data);
+	return 0;
+	}
 
 	/* Check for non-FSB5 banks (e.g. .strings.bank in FEV/RIFF format). */
 	{

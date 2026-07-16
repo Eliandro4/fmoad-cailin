@@ -5,6 +5,8 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+#include "events_db.h"
+
 /*
  * Native FMOD Studio bank parser.
  *
@@ -14,6 +16,8 @@
  *                     GUID and references to the waves it plays
  *   - an embedded FSB5 blob : the actual compressed samples (their names
  *                     match the manifest filenames, e.g. "char_bad_...ogg")
+ *   - a TLNS section: maps each wave GUID to the event GUID that references it
+ *   - a SNDH chunk  : lists the embedded FSB5 blob offsets/sizes
  * The .strings.bank file carries a STDT chunk: a packed radix trie mapping
  * Event GUIDs to string paths (event:/..., bus:/..., vca:/..., snapshot:/...).
  *
@@ -74,7 +78,46 @@ struct fev_strmap {
 	uint32_t cap;
 };
 
+/* One wave GUID -> event GUID mapping extracted from the TLNS section. */
+struct fev_tlns_entry {
+	struct fev_guid wave_guid;
+	struct fev_guid event_guid;
+};
+
+/* Result of parsing a bank's TLNS section. */
+struct fev_tlns {
+	struct fev_tlns_entry *entries;
+	uint32_t count;
+	uint32_t cap;
+};
+
 int fev_parse(const uint8_t *data, size_t size, struct fev_bank *out);
+
+/* Parse the TLNS section from a bank file.  Populates out with wave GUID to
+ * event GUID mappings.  Returns 0 on success, <0 on error.  If no TLNS
+ * section is found, out->count remains 0 and this is not an error. */
+int fev_parse_tlns(const uint8_t *data, size_t size, struct fev_tlns *out);
+
+/* Release storage allocated by fev_parse_tlns(). */
+void fev_tlns_free(struct fev_tlns *tlns);
+
+/* Heuristic: convert an FMOD Studio event path to a candidate sample name.
+ * The returned string must be freed by the caller. */
+char *fev_event_path_to_sample_name(const char *event_path);
+
+/* Match a candidate sample name against FSB5 sample names.
+ * Returns a newly allocated array of matching names (caller frees each
+ * string and the array itself).  *out_count receives the number of matches. */
+char **fev_match_sample_names(const char *candidate, const char **sample_names,
+                               uint32_t sample_count, uint32_t *out_count);
+
+/* Build the bank->events mapping natively from TLNS + .strings.bank + FSB5.
+ * Returns 1 on success (out is populated), 0 if the bank has no events or
+ * the native mapping could not be built.  The caller frees out->entries
+ * and each entry's path with events_db_free(). */
+int bank_build_events(const char *bankname, const uint8_t *bank_data,
+                      size_t bank_size, const char **sample_names,
+                      uint32_t sample_count, struct bank_events *out);
 
 /* Parse the STDT (String Data Table) from a .strings.bank file.
  * Populates out->strings[] with GUID-to-path mappings extracted from the
