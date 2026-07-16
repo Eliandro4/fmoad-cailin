@@ -278,8 +278,27 @@ int bank_load_native(BANK *bank, const char *filename)
 	 * manifest is only consulted as a last-resort fallback if native loading
 	 * fails. */
 	if (bank_extract_fsb5(bank, bank_data, bank_size) == 0) {
-		free(bank_data);
 		bank->native_loaded = true;
+
+		/* Parse the bank's own FEV structure (bank GUID + event list)
+		 * while the raw bytes are still available, so the loader
+		 * identifies the bank and enumerates its events natively,
+		 * without relying on a JSON manifest. */
+		memset(&bank->fev, 0, sizeof(bank->fev));
+		if (fev_parse(bank_data, bank_size, &bank->fev) == 0) {
+			char gstr[37];
+			DPRINT(1, "native FEV parse: %s guid=%s events=%u",
+			       basename(shortname),
+			       bank->fev.has_guid ?
+					fev_guid_str(&bank->fev.guid, gstr, sizeof(gstr))
+					: "(none)",
+			       bank->fev.n_events);
+		} else {
+			DPRINT(1, "native FEV parse failed: %s",
+			       basename(shortname));
+		}
+
+		free(bank_data);
 
 		dot = strrchr(shortname, '.');
 		if (dot)
@@ -287,7 +306,8 @@ int bank_load_native(BANK *bank, const char *filename)
 		bank->path = strdup(basename(shortname));
 
 		/* Resolve the bank's event->sample mapping from the embedded
-		 * database so events can be looked up without a JSON manifest. */
+		 * database so events can be looked up.  (The bank files do not
+		 * carry the event->sample-name linkage; see bank_parse.h.) */
 		memset(&bank->events, 0, sizeof(bank->events));
 		if (events_db_find(basename(shortname), &bank->events)) {
 			DPRINT(1, "native bank loaded: %s (%u events)",
@@ -345,6 +365,7 @@ void bank_free_native(BANK *bank)
 		free(bank->sample_names);
 		free(bank->sample_ogg_data);
 		free(bank->sample_ogg_len);
+		fev_bank_free(&bank->fev);
 		events_db_free(&bank->events);
 	}
 }

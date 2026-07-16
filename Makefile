@@ -1,11 +1,11 @@
 CC =		cc
 CFLAGS =	-c -fPIC -std=c99 -Wall -Werror -O0 -g -I/usr/local/include
 LDFLAGS =	-shared -Wl,-soname,libfmodstudio.so.10 -L/usr/lib -L/usr/local/lib -lopenal -lvorbisfile
-RM =		rm -f fmoad-cailin.o al.o fsb.o vorbis_ogg.o vorbis_db.o vorbis_db.c events_db.o events_db.c events_db_parse.o
+RM =		rm -f fmoad-cailin.o al.o fsb.o vorbis_ogg.o vorbis_db.o vorbis_db.c events_db.o events_db.c events_db_parse.o bank_parse.o
 
 TARGET_LIB =	libfmodstudio.so.10
-SRCS =		fmoad-cailin.c json.c al.c fsb.c vorbis_ogg.c vorbis_db.c events_db.c events_db_parse.c
-OBJS =		fmoad-cailin.o json.o al.o fsb.o vorbis_ogg.o vorbis_db.o events_db.o events_db_parse.o
+SRCS =		fmoad-cailin.c json.c al.c fsb.c vorbis_ogg.c vorbis_db.c events_db.c events_db_parse.c bank_parse.c
+OBJS =		fmoad-cailin.o json.o al.o fsb.o vorbis_ogg.o vorbis_db.o events_db.o events_db_parse.o bank_parse.o
 
 .PHONY: all
 all: $(TARGET_LIB)
@@ -25,6 +25,9 @@ events_db.c: events_db.bin
 
 events_db_parse.o: events_db_parse.c events_db.c
 	$(CC) $(CFLAGS) events_db_parse.c
+
+bank_parse.o: bank_parse.c bank_parse.h
+	$(CC) $(CFLAGS) bank_parse.c
 
 fmoad-cailin.o: fmoad-cailin.c
 	$(CC) $(CFLAGS) fmoad-cailin.c

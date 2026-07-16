@@ -27,6 +27,7 @@
 
 #include "fsb.h"
 #include "events_db.h"
+#include "bank_parse.h"
 
 #define PROJ		"FMOAD-CAILIN"	// project name
 #define MAXSTR		1024
@@ -100,6 +101,11 @@ typedef struct BANK{
 	size_t *sample_ogg_len;
 	/* Native event->sample mapping (from the embedded events DB). */
 	struct bank_events events;
+	/* Native FEV structure parsed straight from the .bank file (bank GUID
+	 * and the per-event GUID / wave references).  This lets the loader
+	 * identify a bank and enumerate its events without the JSON manifest;
+	 * the event->sample-name linkage itself still comes from events_db. */
+	struct fev_bank fev;
 } BANK;
 
 typedef struct SYSTEM{
