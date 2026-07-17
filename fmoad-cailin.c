@@ -328,8 +328,7 @@ int bank_load_native(BANK *bank, const char *filename)
 		bank->path = strdup(basename(shortname));
 
 	/* Resolve the bank's event->sample mapping natively from the bank
-	 * file itself (TLNS + embedded strings + FSB5 sample names), instead
-	 * of relying on the events_db.bin blob. */
+	 * file itself (TLNS + embedded strings + FSB5 sample names). */
 	memset(&bank->events, 0, sizeof(bank->events));
 	if (bank_build_events(basename(shortname), bank_data, bank_size,
 	                      (const char **)bank->sample_names,
@@ -340,6 +339,12 @@ int bank_load_native(BANK *bank, const char *filename)
 		DPRINT(1, "native bank loaded: %s (no embedded events)",
 		       filename);
 	}
+
+	/* Register this bank's samples in the global wave registry so that
+	 * later banks can resolve cross-bank wave references. */
+	fev_wavemap_add_bank(basename(shortname), bank_data, bank_size,
+	                     (const char **)bank->sample_names,
+	                     bank->sample_count);
 
 	free(bank_data);
 	return 0;
@@ -358,7 +363,7 @@ int bank_load_native(BANK *bank, const char *filename)
 			 * mappings into the process-global registry so FMOD
 			 * Studio GUID<->path queries (GetEventByID, LookupID,
 			 * LookupPath, Bank_GetStringInfo) can be answered
-			 * natively, without the events_db.  See docs/bank_parsing.md.
+			 * natively, without external metadata.  See docs/bank_parsing.md.
 			 * The parsed strings live on the BANK for its lifetime. */
 			uint8_t *sb = read_file_bytes(filename, &bank_size);
 			if (sb) {

@@ -5,10 +5,8 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-#include "events_db.h"
-
 /*
- * Native FMOD Studio bank parser.
+ * Native FMOD Studio bank parser with cross-bank wavemap.
  *
  * Each .bank file (RIFF container) carries:
  *   - a BNKI chunk  : the bank GUID (and a 16-byte reserved block)
@@ -21,18 +19,17 @@
  * The .strings.bank file carries a STDT chunk: a packed radix trie mapping
  * Event GUIDs to string paths (event:/..., bus:/..., vca:/..., snapshot:/...).
  *
- * The event -> sample (-name) association is NOT present anywhere inside the
- * bank files: events only point at waves by a 16-byte wave GUID, there is no
- * WBAV/wave-name table, the FSB5 blob carries no per-sample GUIDs, and the
- * referenced samples may live in other banks entirely.  That mapping therefore
- * remains supplied by the embedded events_db.bin (built from the FMOD Studio
- * project manifests).  See docs/bank_parsing.md ("Hybrid Approach").  This
- * module parses everything the banks *do* contain so the loader can identify a
- * bank, enumerate its events, and resolve GUID<->path natively.
+ * Event -> sample resolution is performed natively:
+ *   1. TLNS gives wave_guid -> event_guid
+ *   2. .strings.bank gives event_guid -> event_path
+ *   3. Heuristic converts event_path -> candidate sample_name
+ *   4. FSB5 sample names are matched against the candidate
+ * Cross-bank references are resolved via the global wave registry
+ * populated as banks are loaded.
  *
  * All returned pointers reference borrowed storage (the caller-owned buffer,
  * or the owning BANK's fev struct); the parser allocates only the result
- * arrays, which the caller releases via fev_bank_free().
+ * arrays, which the caller releases via events_db_free().
  */
 
 /* 16-byte FMOD GUID (little-endian, identical layout to FMOD_GUID). */
@@ -64,6 +61,18 @@ struct fev_bank {
 	struct fev_string_entry *strings; /* caller frees strings array and each ->path */
 };
 
+/* Event -> sample mapping entry. */
+struct event_entry {
+	const char *path;   /* event:/... path (lookup key) */
+	const char *file;   /* sample filename (== FSB5 sample name) */
+};
+
+struct bank_events {
+	const char *bankname;          /* base name, e.g. "sfx" */
+	uint32_t count;
+	struct event_entry *entries;   /* caller frees */
+};
+
 /* One global GUID -> path mapping gathered from every .strings.bank that
  * has been loaded.  Used to answer FMOD Studio GUID<->path queries natively
  * (no events_db dependency).  See docs/bank_parsing.md ("Hybrid Approach"). */
@@ -87,6 +96,19 @@ struct fev_tlns_entry {
 /* Result of parsing a bank's TLNS section. */
 struct fev_tlns {
 	struct fev_tlns_entry *entries;
+	uint32_t count;
+	uint32_t cap;
+};
+
+/* Global wave GUID -> sample name registry, populated as banks are loaded.
+ * Used for cross-bank sample resolution. */
+struct fev_wave_entry {
+	struct fev_guid wave_guid;
+	char *sample_name;      /* heap-allocated */
+};
+
+struct fev_wavemap {
+	struct fev_wave_entry *entries;
 	uint32_t count;
 	uint32_t cap;
 };
@@ -118,6 +140,26 @@ char **fev_match_sample_names(const char *candidate, const char **sample_names,
 int bank_build_events(const char *bankname, const uint8_t *bank_data,
                       size_t bank_size, const char **sample_names,
                       uint32_t sample_count, struct bank_events *out);
+
+/* Free the entry array allocated by bank_build_events(). */
+void events_db_free(struct bank_events *be);
+
+/* Register all samples from a loaded bank into the global wave registry.
+ * This enables cross-bank sample resolution: when bank A's events reference
+ * waves that live in bank B, the lookup will find them here. */
+void fev_wavemap_add_bank(const char *bankname, const uint8_t *bank_data,
+                          size_t bank_size, const char **sample_names,
+                          uint32_t sample_count);
+
+/* Look up a wave GUID in the global registry.  Returns the sample name
+ * (borrowed) or NULL if not found. */
+const char *fev_wavemap_lookup(const struct fev_guid *wave_guid);
+
+/* Clear the global wave registry. */
+void fev_wavemap_clear(void);
+
+/* Access the global wave registry (for testing/inspection). */
+struct fev_wavemap *fev_wavemap_get(void);
 
 /* Parse the STDT (String Data Table) from a .strings.bank file.
  * Populates out->strings[] with GUID-to-path mappings extracted from the

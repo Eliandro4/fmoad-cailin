@@ -187,7 +187,7 @@ static void on_evnt(uint32_t id, const uint8_t *payload,
 	 * property chunks).  Record each 16-byte run after the reserved block
 	 * as a wave reference.  The exact count is approximate; it is used
 	 * only for diagnostics, never for sample lookup (that mapping comes
-	 * from events_db). */
+	 * from TLNS + .strings.bank + FSB5 name matching). */
 	const uint8_t *b = g + 16 + 16;
 	const uint8_t *end = payload + size;
 	uint32_t cap = 8;
@@ -807,10 +807,8 @@ char **fev_match_sample_names(const char *candidate, const char **sample_names,
 }
 
 /* ------------------------------------------------------------------ */
-/* Native event->sample mapping builder (replaces events_db.bin).     */
+/* Native event->sample mapping builder.                              */
 /* ------------------------------------------------------------------ */
-
-#include "events_db.h"
 
 int bank_build_events(const char *bankname, const uint8_t *bank_data,
                       size_t bank_size, const char **sample_names,
@@ -832,12 +830,123 @@ int bank_build_events(const char *bankname, const uint8_t *bank_data,
 		return 0;
 	}
 
+	/* Look up event paths from the global string map. */
+	struct fev_strmap *strmap = fev_strmap_get();
+
+	/* First pass: count entries.  We add one entry per (event, sample) pair.
+	 * For intra-bank samples, the sample is matched from the local FSB5 names
+	 * using the event-path heuristic.  For cross-bank samples, the wave GUID
+	 * is looked up in the global wavemap. */
+	uint32_t total_entries = 0;
+	for (uint32_t i = 0; i < tlns.count; i++) {
+		const char *path = NULL;
+		if (strmap && strmap->count > 0)
+			path = fev_strmap_lookup_path(&tlns.entries[i].event_guid);
+
+		if (path) {
+			char *candidate = fev_event_path_to_sample_name(path);
+			if (candidate) {
+				uint32_t matches = 0;
+				char **sample_matches = fev_match_sample_names(candidate,
+				                                              sample_names,
+				                                              sample_count,
+				                                              &matches);
+				free(candidate);
+				total_entries += matches;
+				free(sample_matches);
+			}
+		}
+
+		/* Cross-bank fallback: if no local match, check global wavemap. */
+		if (total_entries == 0 || path == NULL) {
+			const char *xbank_sample = fev_wavemap_lookup(&tlns.entries[i].wave_guid);
+			if (xbank_sample)
+				total_entries++;
+		}
+	}
+
+	if (total_entries == 0) {
+		fev_tlns_free(&tlns);
+		return 0;
+	}
+
+	/* Allocate and populate the entry array. */
+	struct event_entry *entries = calloc(total_entries, sizeof(*entries));
+	if (!entries) {
+		fev_tlns_free(&tlns);
+		return 0;
+	}
+
+	uint32_t idx = 0;
+	for (uint32_t i = 0; i < tlns.count && idx < total_entries; i++) {
+		const char *path = NULL;
+		if (strmap && strmap->count > 0)
+			path = fev_strmap_lookup_path(&tlns.entries[i].event_guid);
+
+		if (path) {
+			char *candidate = fev_event_path_to_sample_name(path);
+			if (candidate) {
+				uint32_t matches = 0;
+				char **sample_matches = fev_match_sample_names(candidate,
+				                                              sample_names,
+				                                              sample_count,
+				                                              &matches);
+				free(candidate);
+
+				for (uint32_t j = 0; j < matches && idx < total_entries; j++) {
+					entries[idx].path = strdup(path);
+					entries[idx].file = sample_matches[j];
+					idx++;
+				}
+				free(sample_matches);
+				continue;
+			}
+		}
+
+		/* Cross-bank fallback. */
+		const char *xbank_sample = fev_wavemap_lookup(&tlns.entries[i].wave_guid);
+		if (xbank_sample && idx < total_entries) {
+			entries[idx].path = path ? strdup(path) : strdup("unknown");
+			entries[idx].file = xbank_sample;
+			idx++;
+		}
+	}
+
+	fev_tlns_free(&tlns);
+	out->count = idx;
+	out->entries = entries;
+	return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Global wave GUID -> sample name registry (cross-bank resolution).  */
+/* ------------------------------------------------------------------ */
+
+static struct fev_wavemap g_wavemap = { NULL, 0, 0 };
+
+void fev_wavemap_add_bank(const char *bankname, const uint8_t *bank_data,
+                          size_t bank_size, const char **sample_names,
+                          uint32_t sample_count)
+{
+	if (!bankname || !bank_data || !sample_names || sample_count == 0)
+		return;
+
+	/* Parse TLNS to get wave_guid -> event_guid mappings. */
+	struct fev_tlns tlns;
+	if (fev_parse_tlns(bank_data, bank_size, &tlns) < 0)
+		return;
+
+	if (tlns.count == 0) {
+		fev_tlns_free(&tlns);
+		return;
+	}
+
 	/* Collect unique event GUIDs from TLNS. */
 	uint32_t cap = tlns.count;
 	struct fev_guid *event_guids = calloc(cap, sizeof(*event_guids));
 	if (!event_guids) {
 		fev_tlns_free(&tlns);
-		return 0;
+		return;
 	}
 	uint32_t nevents = 0;
 	for (uint32_t i = 0; i < tlns.count; i++) {
@@ -857,48 +966,10 @@ int bank_build_events(const char *bankname, const uint8_t *bank_data,
 
 	if (nevents == 0) {
 		free(event_guids);
-		return 0;
+		return;
 	}
 
-	/* Look up event paths from the global string map. */
-	struct fev_strmap *strmap = fev_strmap_get();
-	if (!strmap || strmap->count == 0) {
-		free(event_guids);
-		return 0;
-	}
-
-	/* Count total matches to allocate the entry array. */
-	uint32_t total_entries = 0;
-	for (uint32_t i = 0; i < nevents; i++) {
-		const char *path = fev_strmap_lookup_path(&event_guids[i]);
-		if (!path)
-			continue;
-
-		char *candidate = fev_event_path_to_sample_name(path);
-		if (!candidate)
-			continue;
-
-		uint32_t matches = 0;
-		char **sample_matches = fev_match_sample_names(candidate, sample_names,
-		                                              sample_count, &matches);
-		free(candidate);
-		total_entries += matches;
-		free(sample_matches);
-	}
-
-	if (total_entries == 0) {
-		free(event_guids);
-		return 0;
-	}
-
-	/* Allocate and populate the entry array. */
-	struct event_entry *entries = calloc(total_entries, sizeof(*entries));
-	if (!entries) {
-		free(event_guids);
-		return 0;
-	}
-
-	uint32_t idx = 0;
+	/* For each event, resolve to sample name and register wave_guid -> sample_name. */
 	for (uint32_t i = 0; i < nevents; i++) {
 		const char *path = fev_strmap_lookup_path(&event_guids[i]);
 		if (!path)
@@ -913,16 +984,75 @@ int bank_build_events(const char *bankname, const uint8_t *bank_data,
 		                                              sample_count, &matches);
 		free(candidate);
 
-		for (uint32_t j = 0; j < matches && idx < total_entries; j++) {
-			entries[idx].path = strdup(path);
-			entries[idx].file = sample_matches[j];
-			idx++;
+		for (uint32_t j = 0; j < matches; j++) {
+			/* Find all wave GUIDs for this event in TLNS. */
+			for (uint32_t k = 0; k < tlns.count; k++) {
+				if (fev_guid_eq(&tlns.entries[k].event_guid, &event_guids[i])) {
+					/* Add to global wavemap. */
+					if (g_wavemap.count == g_wavemap.cap) {
+						uint32_t ncap = g_wavemap.cap ? g_wavemap.cap * 2 : 64;
+						struct fev_wave_entry *ne = realloc(g_wavemap.entries,
+						                                     ncap * sizeof(*ne));
+						if (!ne) {
+							free(sample_matches);
+							free(event_guids);
+							fev_tlns_free(&tlns);
+							return;
+						}
+						g_wavemap.entries = ne;
+						g_wavemap.cap = ncap;
+					}
+					struct fev_wave_entry *we = &g_wavemap.entries[g_wavemap.count];
+					we->wave_guid = tlns.entries[k].wave_guid;
+					we->sample_name = strdup(sample_matches[j]);
+					g_wavemap.count++;
+				}
+			}
+			free(sample_matches[j]);
 		}
 		free(sample_matches);
 	}
 
 	free(event_guids);
-	out->count = idx;
-	out->entries = entries;
-	return 1;
+	fev_tlns_free(&tlns);
+}
+
+const char *fev_wavemap_lookup(const struct fev_guid *wave_guid)
+{
+	if (!wave_guid || !g_wavemap.entries)
+		return NULL;
+
+	for (uint32_t i = 0; i < g_wavemap.count; i++) {
+		if (fev_guid_eq(wave_guid, &g_wavemap.entries[i].wave_guid))
+			return g_wavemap.entries[i].sample_name;
+	}
+	return NULL;
+}
+
+void fev_wavemap_clear(void)
+{
+	for (uint32_t i = 0; i < g_wavemap.count; i++)
+		free(g_wavemap.entries[i].sample_name);
+	free(g_wavemap.entries);
+	g_wavemap.entries = NULL;
+	g_wavemap.count = 0;
+	g_wavemap.cap = 0;
+}
+
+struct fev_wavemap *fev_wavemap_get(void)
+{
+	return &g_wavemap;
+}
+
+void events_db_free(struct bank_events *be)
+{
+	if (!be || !be->entries)
+		return;
+	for (uint32_t i = 0; i < be->count; i++) {
+		free((void *)be->entries[i].path);
+		free((void *)be->entries[i].file);
+	}
+	free(be->entries);
+	be->entries = NULL;
+	be->count = 0;
 }

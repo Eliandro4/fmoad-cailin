@@ -26,7 +26,6 @@
 #include "json.h"
 
 #include "fsb.h"
-#include "events_db.h"
 #include "bank_parse.h"
 
 #define PROJ		"FMOAD-CAILIN"	// project name
@@ -99,7 +98,7 @@ typedef struct BANK{
 	char **sample_names;
 	uint8_t **sample_ogg_data;
 	size_t *sample_ogg_len;
-	/* Native event->sample mapping (from the embedded events DB). */
+	/* Native event->sample mapping (from TLNS + .strings.bank + FSB5). */
 	struct bank_events events;
 	/* Native FEV structure parsed straight from the .bank file (bank GUID
 	 * and the per-event GUID / wave references).  This lets the loader
